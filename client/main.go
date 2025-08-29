@@ -22,9 +22,6 @@ func main() {
 
 	// Тест обычного RPC вызова
 	testUnaryRPC(client)
-
-	// Тест streaming RPC вызова
-	testStreamingRPC(client)
 }
 
 func testUnaryRPC(client pb.GreeterClient) {
@@ -38,24 +35,4 @@ func testUnaryRPC(client pb.GreeterClient) {
 	}
 
 	log.Printf("Server response: %s", response.Message)
-}
-
-func testStreamingRPC(client pb.GreeterClient) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	log.Println("Starting streaming RPC...")
-	stream, err := client.StreamMessages(ctx, &pb.StreamRequest{Count: 5})
-	if err != nil {
-		log.Fatalf("could not start stream: %v", err)
-	}
-
-	for {
-		response, err := stream.Recv()
-		if err != nil {
-			log.Printf("Stream ended: %v", err)
-			break
-		}
-		log.Printf("Received stream message %d: %s", response.Index, response.Message)
-	}
 }
