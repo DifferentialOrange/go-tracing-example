@@ -2,66 +2,99 @@ package main
 
 import (
 	"context"
-	"io"
 	"log"
 	"time"
 
 	pb "github.com/DifferentialOrange/go-tracing-example/hello"
-	"github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/ext"
-	"github.com/uber/jaeger-client-go/config"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
 
-func initTracer(serviceName string) (opentracing.Tracer, io.Closer, error) {
-	cfg := &config.Configuration{
-		ServiceName: serviceName,
-		Sampler: &config.SamplerConfig{
-			Type:  "const",
-			Param: 1,
-		},
-		Reporter: &config.ReporterConfig{
-			LogSpans: true,
-		},
+func initTracer(serviceName string) (*sdktrace.TracerProvider, error) {
+	// Создаем Jaeger exporter
+	exporter, err := jaeger.New(jaeger.WithCollectorEndpoint())
+	if err != nil {
+		return nil, err
 	}
-	return cfg.NewTracer()
+
+	// Создаем TracerProvider
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName(serviceName),
+		)),
+	)
+
+	// Устанавливаем глобальный TracerProvider и propagator
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	return tp, nil
 }
 
-func injectSpanContext(ctx context.Context, tracer opentracing.Tracer, span opentracing.Span) context.Context {
-	md := metadata.MD{}
-	err := tracer.Inject(span.Context(), opentracing.HTTPHeaders, metadataTextMap(md))
-	if err != nil {
-		log.Printf("Failed to inject span context: %v", err)
-	}
-	return metadata.NewOutgoingContext(ctx, md)
+func injectSpanContext(ctx context.Context) context.Context {
+	// Создаем carrier для передачи контекста
+	carrier := metadataTextMap{}
+	propagator := otel.GetTextMapPropagator()
+	propagator.Inject(ctx, carrier)
+
+	return metadata.NewOutgoingContext(ctx, metadata.MD(carrier))
 }
 
 type metadataTextMap metadata.MD
 
-func (m metadataTextMap) ForeachKey(handler func(key, val string) error) error {
-	for k, vv := range m {
-		for _, v := range vv {
-			if err := handler(k, v); err != nil {
-				return err
-			}
-		}
+func (m metadataTextMap) Get(key string) string {
+	values := m[key]
+	if len(values) == 0 {
+		return ""
 	}
-	return nil
+	return values[0]
 }
 
-func (m metadataTextMap) Set(key, val string) {
-	m[key] = append(m[key], val)
+func (m metadataTextMap) Set(key, value string) {
+	m[key] = []string{value}
+}
+
+func (m metadataTextMap) Keys() []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func main() {
-	tracer, closer, err := initTracer("grpc-client")
+	// Инициализируем tracer provider
+	tp, err := initTracer("grpc-client")
 	if err != nil {
 		log.Fatalf("Failed to initialize tracer: %v", err)
 	}
-	defer closer.Close()
-	opentracing.SetGlobalTracer(tracer)
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down tracer provider: %v", err)
+		}
+	}()
+
+	// Получаем tracer
+	tracer := otel.GetTracerProvider().Tracer(
+		"grpc-client",
+		trace.WithInstrumentationVersion("1.0.0"),
+		trace.WithSchemaURL(semconv.SchemaURL),
+	)
 
 	// Установка соединения с сервером
 	conn, err := grpc.Dial("localhost:50051",
@@ -79,28 +112,40 @@ func main() {
 	testUnaryRPC(client, tracer)
 }
 
-func testUnaryRPC(client pb.GreeterClient, tracer opentracing.Tracer) {
-	span := tracer.StartSpan("client_unary_call")
-	defer span.Finish()
+func testUnaryRPC(client pb.GreeterClient, tracer trace.Tracer) {
+	// Создаем span для клиентского вызова
+	ctx, span := tracer.Start(context.Background(), "client_unary_call")
+	defer span.End()
 
-	ctx, cancel := context.WithTimeout(opentracing.ContextWithSpan(context.Background(), span), 5*time.Second)
+	// Добавляем атрибуты
+	span.SetAttributes(
+		attribute.String("client.operation", "unary_call"),
+		attribute.String("grpc.target", "localhost:50051"),
+	)
+
+	// Устанавливаем таймаут и внедряем контекст трассировки
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-
-	ctx = injectSpanContext(ctx, tracer, span)
+	ctx = injectSpanContext(ctx)
 
 	log.Println("Sending unary RPC request...")
 	response, err := client.SayHello(ctx, &pb.HelloRequest{Name: "Go Developer"})
 	if err != nil {
-		span.SetTag("error", true)
-		span.LogKV("event", "error", "message", err.Error())
+		// Обрабатываем ошибку
+		span.SetStatus(codes.Error, err.Error())
+		span.RecordError(err)
+		span.SetAttributes(attribute.Bool("error", true))
 		log.Fatalf("could not greet: %v", err)
 	}
 
-	span.LogKV("event", "response_received", "message", response.Message)
+	// Логируем получение ответа
+	span.AddEvent("response_received", trace.WithAttributes(
+		attribute.String("response.message", response.Message),
+	))
 	log.Printf("Server response: %s", response.Message)
 }
 
-func tracingUnaryClientInterceptor(tracer opentracing.Tracer) grpc.UnaryClientInterceptor {
+func tracingUnaryClientInterceptor(tracer trace.Tracer) grpc.UnaryClientInterceptor {
 	return func(
 		ctx context.Context,
 		method string,
@@ -109,24 +154,34 @@ func tracingUnaryClientInterceptor(tracer opentracing.Tracer) grpc.UnaryClientIn
 		invoker grpc.UnaryInvoker,
 		opts ...grpc.CallOption,
 	) error {
-		var span opentracing.Span
-		if parentSpan := opentracing.SpanFromContext(ctx); parentSpan != nil {
-			span = tracer.StartSpan(
-				method,
-				opentracing.ChildOf(parentSpan.Context()),
-			)
-		} else {
-			span = tracer.StartSpan(method)
-		}
-		defer span.Finish()
+		// Создаем span для gRPC вызова
+		ctx, span := tracer.Start(ctx, method,
+			trace.WithSpanKind(trace.SpanKindClient),
+		)
+		defer span.End()
 
-		ext.SpanKindRPCClient.Set(span)
-		ctx = injectSpanContext(ctx, tracer, span)
+		// Добавляем семантические атрибуты
+		span.SetAttributes(
+			attribute.String("rpc.system", "grpc"),
+			attribute.String("rpc.service", "Greeter"),
+			attribute.String("rpc.method", method),
+			attribute.String("grpc.type", "unary"),
+			attribute.String("net.peer.name", cc.Target()),
+		)
 
+		// Внедряем контекст трассировки в исходящие метаданные
+		ctx = injectSpanContext(ctx)
+
+		// Выполняем вызов
 		err := invoker(ctx, method, req, reply, cc, opts...)
+
+		// Обрабатываем результат
 		if err != nil {
-			ext.Error.Set(span, true)
-			span.LogKV("event", "error", "message", err.Error())
+			span.SetStatus(codes.Error, err.Error())
+			span.RecordError(err)
+			span.SetAttributes(attribute.Bool("error", true))
+		} else {
+			span.SetStatus(codes.Ok, "success")
 		}
 
 		return err

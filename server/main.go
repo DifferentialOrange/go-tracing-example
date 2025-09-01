@@ -2,77 +2,114 @@ package main
 
 import (
 	"context"
-	"io"
 	"log"
 	"net"
+	"time"
 
 	pb "github.com/DifferentialOrange/go-tracing-example/hello"
-	"github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/ext"
-	"github.com/uber/jaeger-client-go/config"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
-	"time"
+	"google.golang.org/grpc/status"
 )
 
 type server struct {
 	pb.UnimplementedGreeterServer
-	tracer opentracing.Tracer
+	tracer trace.Tracer
 }
 
-func initTracer(serviceName string) (opentracing.Tracer, io.Closer, error) {
-	cfg := &config.Configuration{
-		ServiceName: serviceName,
-		Sampler: &config.SamplerConfig{
-			Type:  "const",
-			Param: 1,
-		},
-		Reporter: &config.ReporterConfig{
-			LogSpans: true,
-		},
+func initTracer(serviceName string) (*sdktrace.TracerProvider, error) {
+	// Создаем Jaeger exporter
+	exporter, err := jaeger.New(jaeger.WithCollectorEndpoint())
+	if err != nil {
+		return nil, err
 	}
-	return cfg.NewTracer()
+
+	// Создаем TracerProvider
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName(serviceName),
+		)),
+	)
+
+	// Устанавливаем глобальный TracerProvider и propagator
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	return tp, nil
 }
 
-func extractSpanContext(ctx context.Context, tracer opentracing.Tracer) (opentracing.SpanContext, error) {
+func extractSpanContext(ctx context.Context) context.Context {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		return nil, nil
+		return ctx
 	}
-	return tracer.Extract(opentracing.HTTPHeaders, metadataTextMap(md))
+
+	// Извлекаем trace context из метаданных
+	carrier := metadataTextMap(md)
+	propagator := otel.GetTextMapPropagator()
+	return propagator.Extract(ctx, carrier)
 }
 
 type metadataTextMap metadata.MD
 
-func (m metadataTextMap) ForeachKey(handler func(key, val string) error) error {
-	for k, vv := range m {
-		for _, v := range vv {
-			if err := handler(k, v); err != nil {
-				return err
-			}
-		}
+func (m metadataTextMap) Get(key string) string {
+	values := m[key]
+	if len(values) == 0 {
+		return ""
 	}
-	return nil
+	return values[0]
 }
 
-func (m metadataTextMap) Set(key, val string) {
-	m[key] = append(m[key], val)
+func (m metadataTextMap) Set(key, value string) {
+	m[key] = []string{value}
+}
+
+func (m metadataTextMap) Keys() []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func (s *server) SayHello(ctx context.Context, req *pb.HelloRequest) (*pb.HelloResponse, error) {
-	spanCtx, _ := extractSpanContext(ctx, s.tracer)
-	span := s.tracer.StartSpan("SayHello", opentracing.ChildOf(spanCtx))
-	defer span.Finish()
+	// Извлекаем контекст трассировки
+	ctx = extractSpanContext(ctx)
 
-	span.SetTag("request.name", req.Name)
-	span.LogKV("event", "received request")
+	// Создаем span для обработки запроса
+	ctx, span := s.tracer.Start(ctx, "SayHello")
+	defer span.End()
+
+	// Добавляем атрибуты (заменяют SetTag)
+	span.SetAttributes(
+		attribute.String("request.name", req.Name),
+		attribute.String("grpc.method", "SayHello"),
+	)
+
+	// Логируем событие (заменяет LogKV)
+	span.AddEvent("received request")
 
 	log.Printf("Received request from: %s", req.Name)
 
 	// Имитация работы
 	time.Sleep(100 * time.Millisecond)
 
-	span.LogKV("event", "sending response")
+	// Логируем отправку ответа
+	span.AddEvent("sending response")
 
 	return &pb.HelloResponse{
 		Message: "Hello, " + req.Name + "! Welcome to gRPC server!",
@@ -80,12 +117,23 @@ func (s *server) SayHello(ctx context.Context, req *pb.HelloRequest) (*pb.HelloR
 }
 
 func main() {
-	tracer, closer, err := initTracer("grpc-server")
+	// Инициализируем tracer provider
+	tp, err := initTracer("grpc-server")
 	if err != nil {
 		log.Fatalf("Failed to initialize tracer: %v", err)
 	}
-	defer closer.Close()
-	opentracing.SetGlobalTracer(tracer)
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down tracer provider: %v", err)
+		}
+	}()
+
+	// Получаем tracer из provider
+	tracer := otel.GetTracerProvider().Tracer(
+		"grpc-server",
+		trace.WithInstrumentationVersion("1.0.0"),
+		trace.WithSchemaURL(semconv.SchemaURL),
+	)
 
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {
@@ -105,20 +153,50 @@ func main() {
 	}
 }
 
-func tracingUnaryInterceptor(tracer opentracing.Tracer) grpc.UnaryServerInterceptor {
+func tracingUnaryInterceptor(tracer trace.Tracer) grpc.UnaryServerInterceptor {
 	return func(
 		ctx context.Context,
 		req interface{},
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
 	) (interface{}, error) {
-		spanCtx, _ := extractSpanContext(ctx, tracer)
-		span := tracer.StartSpan(info.FullMethod, opentracing.ChildOf(spanCtx))
-		defer span.Finish()
+		// Извлекаем контекст трассировки из метаданных
+		ctx = extractSpanContext(ctx)
 
-		ext.SpanKindRPCServer.Set(span)
-		ctx = opentracing.ContextWithSpan(ctx, span)
+		// Создаем span для gRPC метода
+		ctx, span := tracer.Start(ctx, info.FullMethod,
+			trace.WithSpanKind(trace.SpanKindServer),
+		)
+		defer span.End()
 
-		return handler(ctx, req)
+		// Добавляем атрибуты gRPC
+		span.SetAttributes(
+			attribute.String("rpc.system", "grpc"),
+			attribute.String("rpc.service", "Greeter"),
+			attribute.String("rpc.method", info.FullMethod),
+			attribute.String("grpc.type", "unary"),
+		)
+
+		// Обрабатываем запрос
+		resp, err := handler(ctx, req)
+
+		// Обрабатываем ошибку, если есть
+		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
+			if s, ok := status.FromError(err); ok {
+				span.SetAttributes(
+					attribute.Int("rpc.grpc.status_code", int(s.Code())),
+					attribute.String("rpc.grpc.status_message", s.Message()),
+				)
+			}
+			span.RecordError(err)
+		} else {
+			span.SetStatus(codes.Ok, "success")
+			span.SetAttributes(
+				attribute.Int("rpc.grpc.status_code", 0), // OK
+			)
+		}
+
+		return resp, err
 	}
 }
