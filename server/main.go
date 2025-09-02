@@ -10,7 +10,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -26,9 +26,9 @@ type server struct {
 	tracer trace.Tracer
 }
 
-func initTracer(serviceName string) (*sdktrace.TracerProvider, error) {
-	// Создаем Jaeger exporter
-	exporter, err := jaeger.New(jaeger.WithCollectorEndpoint())
+func initTracer(ctx context.Context, serviceName string) (*sdktrace.TracerProvider, error) {
+	// Создаем OTEL exporter
+	exporter, err := otlptracehttp.New(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +118,7 @@ func (s *server) SayHello(ctx context.Context, req *pb.HelloRequest) (*pb.HelloR
 
 func main() {
 	// Инициализируем tracer provider
-	tp, err := initTracer("grpc-server")
+	tp, err := initTracer(context.Background(), "grpc-server")
 	if err != nil {
 		log.Fatalf("Failed to initialize tracer: %v", err)
 	}

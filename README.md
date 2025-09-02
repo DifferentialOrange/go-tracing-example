@@ -11,27 +11,23 @@ protoc --go_out=. --go-grpc_out=. proto/hello.proto
 All commands should be run from the root in a separate terminals.
 
 ```bash
-docker run -d --name jaeger \
-  -e COLLECTOR_ZIPKIN_HTTP_PORT=9411 \
-  -p 5775:5775/udp \
-  -p 6831:6831/udp \
-  -p 6832:6832/udp \
-  -p 5778:5778 \
+docker run --rm --name jaeger \
   -p 16686:16686 \
-  -p 14268:14268 \
-  -p 14250:14250 \
+  -p 4317:4317 \
+  -p 4318:4318 \
+  -p 5778:5778 \
   -p 9411:9411 \
-  jaegertracing/all-in-one:1.6
+  cr.jaegertracing.io/jaegertracing/jaeger:2.9.0
 ```
 
 ```bash
 cd ./server
-go run main.go
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 go run main.go
 ```
 
 ```bash
 cd ./client
-go run main.go
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 go run main.go
 ```
 
 To see traces, use
